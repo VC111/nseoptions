@@ -1,1 +1,3 @@
-worker: python bt5.py
+
+worker: python -m playwright install chromium && python bt5.py
+
