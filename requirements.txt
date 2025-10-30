@@ -1,4 +1,5 @@
 playwright>=1.30
 python-telegram-bot==13.15
 schedule
+urllib3
 imghdr2
