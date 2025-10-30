@@ -11,6 +11,7 @@ import asyncio
 from datetime import datetime, time as dt_time
 from playwright.async_api import async_playwright
 from telegram import Bot
+from telegram.request import HTTPXRequest
 import logging
 
 # ---------- CONFIG ----------
@@ -38,7 +39,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("bt5")
 
 # Telegram bot (synchronous send wrapped via asyncio.to_thread)
-bot = Bot(token=TELEGRAM_TOKEN)
+request = HTTPXRequest()
+bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)
 
 
 # ---------- Parsing helpers ----------
