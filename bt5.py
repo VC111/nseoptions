@@ -40,7 +40,7 @@ logger = logging.getLogger("bt5")
 
 # Telegram bot (synchronous send wrapped via asyncio.to_thread)
 request = HTTPXRequest()
-bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)
+bot = Bot(token=TELEGRAM_TOKEN, request=request)
 
 
 # ---------- Parsing helpers ----------
