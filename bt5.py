@@ -1,401 +1,469 @@
 import os
-#!/usr/bin/env python3
-"""
-bt5.py - Quantsapp CE/PE scraper that posts ΔOI and ΔLTP to Telegram.
-Drop-in: update QUANTSAPP_URL, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, and if needed adjust IDX mapping.
-"""
-
-import os
 import json
 import asyncio
+import sys
+import requests
+import pytz
 from datetime import datetime, time as dt_time
-from playwright.async_api import async_playwright
 from telegram import Bot
 from telegram.request import HTTPXRequest
 import logging
 
-# ---------- CONFIG ----------
-QUANTSAPP_URL = "https://web.quantsapp.com/option-chain"  # <-- set correct page / URL you use
+# ---------- CONFIGURATION ----------
 CACHE_FILE = "last_oi.json"
-TELEGRAM_TOKEN = "8438185244:AAGt75e741i4XBsS14EiZAQS4VUZVV1w3RU"
-TELEGRAM_CHAT_ID = "@nseopn"  # int or str
-FETCH_INTERVAL_SECONDS = 900  # when running continuously
-RUN_DURING_MARKET_HOURS = True  # set False to run 24/7
-MARKET_START = dt_time(9, 15)
-MARKET_END = dt_time(15, 30)
-# Column indices for the Quantsapp table (0-based). Adjust if your table layout differs.
-# Typical mapping: [.., ce_oi, ce_ltp, strike, pe_ltp, pe_oi, ..] but confirm on your page.
-IDX = {
-    "strike": 6,
-    "ce_oi": 3,
-    "ce_ltp": 5,
-    "pe_ltp": 7,
-    "pe_oi": 9,
-}
-# ----------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("bt5")
+# Market timings (IST)
+MARKET_START = dt_time(9, 15)   # 9:15 AM IST
+MARKET_END = dt_time(15, 30)    # 3:30 PM IST
 
-# Telegram bot (synchronous send wrapped via asyncio.to_thread)
-request = HTTPXRequest()
-bot = Bot(token=TELEGRAM_TOKEN, request=request)
+# NSE API endpoints
+NSE_HOME = "https://www.nseindia.com"
+EXPIRY_URL = "https://www.nseindia.com/api/option-chain-contract-info?symbol=NIFTY"
+OPTION_CHAIN_URL = "https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY&expiry={exp}"
 
+# Request settings
+REQUEST_TIMEOUT = 15
+MAX_RETRIES = 3
+RETRY_DELAY = 2
 
-# ---------- Parsing helpers ----------
-def parse_num_oi(s):
-    """Parse OI-like strings to integer (supports K, L, CR, commas)."""
-    if s is None:
-        return 0
-    t = str(s).strip().upper().replace(",", "")
-    if t in ("", "-", "--"):
-        return 0
-    try:
-        # Common suffixes
-        if t.endswith("CR"):
-            return int(float(t[:-2]) * 1e7)
-        if t.endswith("L"):
-            return int(float(t[:-1]) * 1e5)
-        if t.endswith("K"):
-            return int(float(t[:-1]) * 1e3)
-        # plain number
-        return int(float(t))
-    except Exception:
-        # fallback: extract digits and dot then to float
-        cleaned = "".join(ch for ch in t if (ch.isdigit() or ch in ".-"))
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("nse-bot")
+
+# Timezone
+IST = pytz.timezone('Asia/Kolkata')
+# ------------------------------------
+
+class NSESession:
+    """Manage NSE session with cookies"""
+    
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.nseindia.com/",
+        })
+    
+    def get_cookies(self):
+        """Initialize session cookies"""
         try:
-            return int(float(cleaned)) if cleaned else 0
-        except Exception:
-            return 0
-
-
-def parse_ltp_value(s):
-    """Parse LTP display strings into float. Safe fallback 0.0."""
-    if s is None:
-        return 0.0
-    t = str(s).strip()
-    if t in ("", "-", "--"):
-        return 0.0
-    try:
-        return float(t.replace(",", ""))
-    except Exception:
-        cleaned = "".join(ch for ch in t if (ch.isdigit() or ch in ".-"))
-        try:
-            return float(cleaned) if cleaned else 0.0
-        except Exception:
-            return 0.0
-
-
-def human_fmt(n):
-    """Readable OI formatting without sign (for display)."""
-    try:
-        n = float(n)
-    except Exception:
-        return str(n)
-    n_abs = abs(n)
-    if n_abs >= 1e7:
-        return f"{n_abs/1e7:.2f}Cr"
-    if n_abs >= 1e5:
-        return f"{n_abs/1e5:.2f}L"
-    if n_abs >= 1e3:
-        return f"{n_abs/1e3:.2f}K"
-    if n_abs.is_integer():
-        return f"{int(n_abs)}"
-    return f"{n_abs:.2f}"
-
-
-def fmt_delta_oi(n):
-    sign = "+" if n >= 0 else "-"
-    n_abs = abs(n)
-    if n_abs >= 1e7:
-        return f"{sign}{n_abs/1e7:.2f}Cr"
-    if n_abs >= 1e5:
-        return f"{sign}{n_abs/1e5:.2f}L"
-    if n_abs >= 1e3:
-        return f"{sign}{n_abs/1e3:.2f}K"
-    return f"{sign}{int(n_abs)}"
-
-
-def fmt_delta_ltp(n):
-    sign = "+" if n >= 0 else "-"
-    return f"{sign}{abs(n):.2f}"
-
-
-# ---------- Cache helpers ----------
-def load_last_oi():
-    """Load JSON cache and migrate older formats if necessary."""
-    if not os.path.exists(CACHE_FILE):
-        return {}
-    try:
-        with open(CACHE_FILE, "r") as f:
-            store = json.load(f)
-    except Exception as e:
-        logger.warning("Failed reading cache: %s", e)
-        return {}
-
-    migrated = False
-    for strike, entry in list(store.items()):
-        if not isinstance(entry, dict):
-            store[strike] = {"ce": 0, "pe": 0, "ce_ltp": 0.0, "pe_ltp": 0.0}
-            migrated = True
-            continue
-        if "ce_ltp" not in entry:
-            entry["ce_ltp"] = float(entry.get("ce_ltp_num", 0.0) or 0.0)
-            migrated = True
-        if "pe_ltp" not in entry:
-            entry["pe_ltp"] = float(entry.get("pe_ltp_num", 0.0) or 0.0)
-            migrated = True
-        if "ce" not in entry:
-            entry["ce"] = int(entry.get("ce_oi", 0) or 0)
-            migrated = True
-        if "pe" not in entry:
-            entry["pe"] = int(entry.get("pe_oi", 0) or 0)
-            migrated = True
-
-    if migrated:
-        try:
-            with open(CACHE_FILE, "w") as f:
-                json.dump(store, f)
-            logger.info("Migrated old cache to include ce_ltp/pe_ltp/ce/pe")
+            self.session.get(NSE_HOME, timeout=REQUEST_TIMEOUT)
+            logger.info("✅ NSE session cookies obtained")
+            return True
         except Exception as e:
-            logger.warning("Failed writing migrated cache: %s", e)
-
-    return store
-
-
-def save_last_oi(data_rows):
-    """Save normalized numeric OI & LTP for each strike to cache."""
-    store = {}
-    for d in data_rows:
-        strike = d.get("strike", "<no-strike>")
-        ce_ltp_val = float(d.get("ce_ltp", d.get("ce_ltp_num", 0.0) or 0.0))
-        pe_ltp_val = float(d.get("pe_ltp", d.get("pe_ltp_num", 0.0) or 0.0))
-        store[strike] = {
-            "ce": int(d.get("ce_oi", 0) or 0),
-            "pe": int(d.get("pe_oi", 0) or 0),
-            "ce_ltp": ce_ltp_val,
-            "pe_ltp": pe_ltp_val,
-        }
-    try:
-        with open(CACHE_FILE, "w") as f:
-            json.dump(store, f)
-    except Exception as e:
-        logger.warning("Failed saving cache: %s", e)
-
-
-# ---------- Fetching & delta computation ----------
-async def fetch_quantsapp_data():
-    """
-    Scrape Quantsapp table and return list of rows with guaranteed keys:
-      strike (str), ce_oi (int), pe_oi (int), ce_oi_raw, pe_oi_raw,
-      ce_ltp (float), pe_ltp (float), ce_ltp_raw, pe_ltp_raw
-    """
-    out = []
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        logger.info("Navigating to %s", QUANTSAPP_URL)
-        await page.goto(QUANTSAPP_URL, timeout=60000)
-        await page.wait_for_selector("table tbody tr", timeout=60000)
-        # small wait to allow JS table fill
-        await page.wait_for_timeout(1200)
-        rows = await page.query_selector_all("table tbody tr")
-        logger.info("Found %d rows", len(rows))
-
-        for row in rows:
+            logger.warning(f"⚠️ Failed to get cookies: {e}")
+            return False
+    
+    def fetch_json(self, url):
+        """Fetch JSON with retry logic"""
+        for attempt in range(MAX_RETRIES):
             try:
-                cols = await row.query_selector_all("td")
-                # ensure we have enough columns; skip otherwise
-                if len(cols) <= max(IDX.values()):
-                    continue
-
-                strike = (await cols[IDX["strike"]].inner_text()).strip()
-                ce_oi_raw = (await cols[IDX["ce_oi"]].inner_text()).strip()
-                ce_ltp_raw = (await cols[IDX["ce_ltp"]].inner_text()).strip()
-                pe_ltp_raw = (await cols[IDX["pe_ltp"]].inner_text()).strip()
-                pe_oi_raw = (await cols[IDX["pe_oi"]].inner_text()).strip()
-
-                ce_oi_num = parse_num_oi(ce_oi_raw)
-                pe_oi_num = parse_num_oi(pe_oi_raw)
-                ce_ltp_num = parse_ltp_value(ce_ltp_raw)
-                pe_ltp_num = parse_ltp_value(pe_ltp_raw)
-
-                out.append({
-                    "strike": strike,
-                    "ce_oi": ce_oi_num,
-                    "pe_oi": pe_oi_num,
-                    "ce_oi_raw": ce_oi_raw,
-                    "pe_oi_raw": pe_oi_raw,
-                    "ce_ltp_raw": ce_ltp_raw,
-                    "pe_ltp_raw": pe_ltp_raw,
-                    "ce_ltp": float(ce_ltp_num),
-                    "pe_ltp": float(pe_ltp_num),
-                    "ce_ltp_num": float(ce_ltp_num),
-                    "pe_ltp_num": float(pe_ltp_num),
-                })
+                resp = self.session.get(url, timeout=REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                return resp.json()
             except Exception as e:
-                # don't crash on single-row parse failure
-                logger.debug("Row parse failed: %s", e)
-                continue
-
-        await browser.close()
-    return out
+                logger.warning(f"Attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    asyncio.sleep(RETRY_DELAY)
+        return None
 
 
-def calc_delta(data_rows, prev_cache):
-    """
-    For each row in data_rows, compute:
-      ce_delta (formatted), pe_delta
-      ce_ltp_change (formatted), pe_ltp_change
-    And ensure numeric ce_ltp/pe_ltp exist on each row.
-    """
-    result = []
-    for d in data_rows:
+class CacheManager:
+    """Handle OI cache storage"""
+    
+    def __init__(self, cache_file=CACHE_FILE):
+        self.cache_file = cache_file
+    
+    def load(self):
+        """Load cache from file"""
+        if not os.path.exists(self.cache_file):
+            logger.info("📁 No cache file found, starting fresh")
+            return {}
+        
         try:
-            strike = d.get("strike", "<no-strike>")
-            prev_entry = prev_cache.get(strike, {})
-
-            ce_old = int(prev_entry.get("ce", prev_entry.get("ce_oi", 0) or 0))
-            pe_old = int(prev_entry.get("pe", prev_entry.get("pe_oi", 0) or 0))
-            ce_old_ltp = float(prev_entry.get("ce_ltp", prev_entry.get("ce_ltp_num", 0.0) or 0.0))
-            pe_old_ltp = float(prev_entry.get("pe_ltp", prev_entry.get("pe_ltp_num", 0.0) or 0.0))
-
-            ce_curr_oi = int(d.get("ce_oi", 0) or 0)
-            pe_curr_oi = int(d.get("pe_oi", 0) or 0)
-            ce_curr_ltp = float(d.get("ce_ltp", d.get("ce_ltp_num", 0.0) or 0.0))
-            pe_curr_ltp = float(d.get("pe_ltp", d.get("pe_ltp_num", 0.0) or 0.0))
-
-            # write normalized numeric LTPs back onto the row
-            d["ce_ltp"] = ce_curr_ltp
-            d["pe_ltp"] = pe_curr_ltp
-
-            ce_delta_val = ce_curr_oi - ce_old
-            pe_delta_val = pe_curr_oi - pe_old
-            ce_ltp_delta = ce_curr_ltp - ce_old_ltp
-            pe_ltp_delta = pe_curr_ltp - pe_old_ltp
-
-            d["ce_delta"] = fmt_delta_oi(ce_delta_val)
-            d["pe_delta"] = fmt_delta_oi(pe_delta_val)
-            d["ce_ltp_change"] = fmt_delta_ltp(ce_ltp_delta)
-            d["pe_ltp_change"] = fmt_delta_ltp(pe_ltp_delta)
-
-            result.append(d)
+            with open(self.cache_file, 'r') as f:
+                data = json.load(f)
+            
+            # Validate and clean
+            clean_data = {}
+            for strike, entry in data.items():
+                if isinstance(entry, dict):
+                    clean_data[strike] = {
+                        "ce": int(entry.get("ce", 0)),
+                        "pe": int(entry.get("pe", 0)),
+                        "ce_ltp": float(entry.get("ce_ltp", 0.0)),
+                        "pe_ltp": float(entry.get("pe_ltp", 0.0)),
+                    }
+            
+            logger.info(f"📂 Loaded {len(clean_data)} strikes from cache")
+            return clean_data
         except Exception as e:
-            logger.debug("calc_delta failed for strike=%s: %s", d.get("strike", "?"), e)
-            continue
-    return result
+            logger.warning(f"⚠️ Cache load failed: {e}")
+            return {}
+    
+    def save(self, data_rows):
+        """Save current data to cache"""
+        cache_data = {}
+        for row in data_rows:
+            strike = row.get("strike")
+            if strike:
+                cache_data[strike] = {
+                    "ce": int(row.get("ce_oi", 0)),
+                    "pe": int(row.get("pe_oi", 0)),
+                    "ce_ltp": float(row.get("ce_ltp", 0.0)),
+                    "pe_ltp": float(row.get("pe_ltp", 0.0)),
+                }
+        
+        try:
+            with open(self.cache_file, 'w') as f:
+                json.dump(cache_data, f, indent=2)
+            logger.info(f"💾 Saved {len(cache_data)} strikes to cache")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Cache save failed: {e}")
+            return False
 
 
-# ---------- Formatters & Telegram send ----------
-def format_ce_message(rows, top_n=15):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    header = f"📈 *NIFTY CE (Call)*\n🕒 {now}\n\n"
-    body = "```\nStrike | OI       | ΔOI     | LTP (Δ)\n"
-    body += "-------------------------------------\n"
-    for d in (rows or [])[:top_n]:
-        strike = d.get("strike", "-")
-        oi_disp = d.get("ce_oi_raw") or human_fmt(d.get("ce_oi", 0))
-        delta = d.get("ce_delta", "+0")
-        ltp = d.get("ce_ltp", d.get("ce_ltp_num", 0.0)) or 0.0
-        ltp_change = d.get("ce_ltp_change", "+0.00")
-        body += f"{strike:6} | {oi_disp:8} | {delta:7} | {ltp:6.2f} ({ltp_change})\n"
-    body += "```\nSource: web.quantsapp.com"
-    return header + body
-
-def format_pe_message(rows, top_n=15):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    header = f"📉 *NIFTY PE (Put)*\n🕒 {now}\n\n"
-    body = "```\nStrike | OI       | ΔOI     | LTP (Δ)\n"
-    body += "-------------------------------------\n"
-    for d in (rows or [])[:top_n]:
-        strike = d.get("strike", "-")
-        oi_disp = d.get("pe_oi_raw") or human_fmt(d.get("pe_oi", 0))
-        delta = d.get("pe_delta", "+0")
-        ltp = d.get("pe_ltp", d.get("pe_ltp_num", 0.0)) or 0.0
-        ltp_change = d.get("pe_ltp_change", "+0.00")
-        body += f"{strike:6} | {oi_disp:8} | {delta:7} | {ltp:6.2f} ({ltp_change})\n"
-    body += "```\nSource: web.quantsapp.com"
-    return header + body
-
-
-async def send_to_telegram(text, parse_mode="Markdown"):
-    """Send message using python-telegram-bot Bot in a thread to avoid blocking."""
-    try:
-        await asyncio.to_thread(bot.send_message, chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode=parse_mode)
-    except Exception as e:
-        logger.warning("Telegram send failed: %s", e)
-
-
-# ---------- Orchestration ----------
-async def fetch_and_post_once():
-    logger.info("Fetching Quantsapp data at %s ...", datetime.now())
-    data = await fetch_quantsapp_data()
-    if not data:
-        logger.warning("No rows fetched.")
-        return
-
-    prev = load_last_oi()
-    computed = calc_delta(data, prev)
-    # sort if needed: example sort by strike numeric ascending
-    try:
-        computed.sort(key=lambda r: float(r.get("strike", 0)))
-    except Exception:
-        # if strike is not numeric, leave order as-is
-        pass
-
-    # Save cache for next run
-    save_last_oi(computed)
-    # Format and send messages (split CE / PE)
-    ce_msg = format_ce_message(computed, top_n=15)
-    pe_msg = format_pe_message(computed, top_n=15)
-
-    # send CE then PE
-    await send_to_telegram(ce_msg)
-    await asyncio.sleep(0.5)  # small spacing
-    await send_to_telegram(pe_msg)
-    logger.info("Posted CE and PE messages to Telegram.")
-
-
-def in_market_hours():
-    if not RUN_DURING_MARKET_HOURS:
-        return True
-    now = datetime.now()
-    if now.weekday() >= 5:  # Sat=5, Sun=6
-        return False
-    t = now.time()
-    return (MARKET_START <= t <= MARKET_END)
-
-
-async def main_loop():
-    logger.info("Starting CE/PE Option Chain Bot...")
-    # quick health check for Telegram
-    try:
-        await asyncio.to_thread(bot.get_me)
-        logger.info("Telegram connection OK.")
-    except Exception as e:
-        logger.error("Telegram connection failed: %s", e)
-        return
-
-    while True:
-        if in_market_hours():
-            try:
-                await fetch_and_post_once()
-            except Exception as e:
-                logger.exception("fetch_and_post_once failed: %s", e)
+class DataParser:
+    """Parse NSE option chain data"""
+    
+    @staticmethod
+    def format_number(num):
+        """Format large numbers to K/L/Cr"""
+        try:
+            num = float(num)
+        except:
+            return str(num)
+        
+        abs_num = abs(num)
+        if abs_num >= 1e7:
+            return f"{abs_num/1e7:.2f}Cr"
+        if abs_num >= 1e5:
+            return f"{abs_num/1e5:.2f}L"
+        if abs_num >= 1e3:
+            return f"{abs_num/1e3:.2f}K"
+        return str(int(abs_num)) if abs_num.is_integer() else f"{abs_num:.2f}"
+    
+    @staticmethod
+    def format_delta(num, is_oi=True):
+        """Format delta with sign"""
+        if abs(num) < 0.01:
+            return "  0" if is_oi else "  0.00"
+        
+        sign = "+" if num > 0 else "-"
+        abs_num = abs(num)
+        
+        if is_oi:
+            if abs_num >= 1e7:
+                return f"{sign}{abs_num/1e7:.2f}Cr"
+            if abs_num >= 1e5:
+                return f"{sign}{abs_num/1e5:.2f}L"
+            if abs_num >= 1e3:
+                return f"{sign}{abs_num/1e3:.2f}K"
+            return f"{sign}{int(abs_num)}"
         else:
-            logger.info("Outside market hours. Sleeping.")
-        await asyncio.sleep(FETCH_INTERVAL_SECONDS)
+            return f"{sign}{abs_num:.2f}"
+    
+    def parse_option_chain(self, json_data):
+        """Extract option chain data from JSON"""
+        rows = []
+        try:
+            records = json_data.get("records", {}).get("data", [])
+            
+            for item in records:
+                strike = str(item.get("strikePrice"))
+                ce = item.get("CE", {})
+                pe = item.get("PE", {})
+                
+                # Skip if no data
+                if not ce and not pe:
+                    continue
+                
+                ce_oi = ce.get("openInterest", 0)
+                pe_oi = pe.get("openInterest", 0)
+                ce_ltp = ce.get("lastPrice", 0.0) or 0.0
+                pe_ltp = pe.get("lastPrice", 0.0) or 0.0
+                
+                rows.append({
+                    "strike": strike,
+                    "ce_oi": int(ce_oi),
+                    "pe_oi": int(pe_oi),
+                    "ce_ltp": float(ce_ltp),
+                    "pe_ltp": float(pe_ltp),
+                    "ce_oi_display": self.format_number(ce_oi),
+                    "pe_oi_display": self.format_number(pe_oi),
+                })
+            
+            logger.info(f"📊 Parsed {len(rows)} strikes")
+        except Exception as e:
+            logger.error(f"❌ Parse failed: {e}")
+        
+        return rows
+    
+    def calculate_changes(self, current_rows, previous_cache):
+        """Calculate OI and LTP changes"""
+        result = []
+        
+        for row in current_rows:
+            strike = row["strike"]
+            prev = previous_cache.get(strike, {})
+            
+            # Current values
+            ce_curr = row["ce_oi"]
+            pe_curr = row["pe_oi"]
+            ce_ltp_curr = row["ce_ltp"]
+            pe_ltp_curr = row["pe_ltp"]
+            
+            # Previous values
+            ce_prev = prev.get("ce", 0)
+            pe_prev = prev.get("pe", 0)
+            ce_ltp_prev = prev.get("ce_ltp", 0.0)
+            pe_ltp_prev = prev.get("pe_ltp", 0.0)
+            
+            # Calculate changes
+            row["ce_delta"] = self.format_delta(ce_curr - ce_prev, is_oi=True)
+            row["pe_delta"] = self.format_delta(pe_curr - pe_prev, is_oi=True)
+            row["ce_ltp_change"] = self.format_delta(ce_ltp_curr - ce_ltp_prev, is_oi=False)
+            row["pe_ltp_change"] = self.format_delta(pe_ltp_curr - pe_ltp_prev, is_oi=False)
+            
+            # Raw values for sorting
+            row["ce_delta_raw"] = ce_curr - ce_prev
+            row["pe_delta_raw"] = pe_curr - pe_prev
+            
+            result.append(row)
+        
+        return result
+
+
+class TelegramSender:
+    """Handle Telegram messages"""
+    
+    def __init__(self, token, chat_id):
+        self.token = token
+        self.chat_id = chat_id
+        self.bot = None
+    
+    async def initialize(self):
+        """Initialize bot connection"""
+        if not self.token or not self.chat_id:
+            logger.error("❌ Telegram credentials missing")
+            return False
+        
+        try:
+            request = HTTPXRequest(connection_pool_size=1)
+            self.bot = Bot(token=self.token, request=request)
+            me = await asyncio.to_thread(self.bot.get_me)
+            logger.info(f"✅ Telegram connected: @{me.username}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Telegram init failed: {e}")
+            return False
+    
+    def format_option_message(self, data_rows, option_type="CE"):
+        """Format message for CE or PE"""
+        now = datetime.now(IST).strftime("%Y-%m-%d %H:%M")
+        
+        # Header
+        if option_type == "CE":
+            header = f"📈 *NIFTY Call Options (CE)*\n🕒 {now} IST\n\n"
+            oi_key = "ce_oi_display"
+            delta_key = "ce_delta"
+            ltp_key = "ce_ltp"
+            ltp_change_key = "ce_ltp_change"
+            delta_raw_key = "ce_delta_raw"
+        else:
+            header = f"📉 *NIFTY Put Options (PE)*\n🕒 {now} IST\n\n"
+            oi_key = "pe_oi_display"
+            delta_key = "pe_delta"
+            ltp_key = "pe_ltp"
+            ltp_change_key = "pe_ltp_change"
+            delta_raw_key = "pe_delta_raw"
+        
+        # Sort by biggest change first
+        sorted_rows = sorted(
+            data_rows,
+            key=lambda x: abs(x.get(delta_raw_key, 0)),
+            reverse=True
+        )[:15]  # Top 15
+        
+        # Sort by strike for display
+        sorted_rows.sort(key=lambda x: float(x.get("strike", 0)))
+        
+        # Build message
+        body = "```\n"
+        body += "Strike | OI       | ΔOI     | LTP   (ΔLTP)\n"
+        body += "------|----------|---------|---------------\n"
+        
+        for row in sorted_rows:
+            strike = row.get("strike", "").rjust(6)
+            oi = row.get(oi_key, "0").rjust(8)
+            delta = row.get(delta_key, "  0").rjust(7)
+            ltp = float(row.get(ltp_key, 0.0))
+            ltp_change = row.get(ltp_change_key, "  0.00")
+            
+            body += f"{strike} | {oi} | {delta} | {ltp:6.2f} ({ltp_change})\n"
+        
+        body += "```\n"
+        body += "🔹 *Top 15 by OI change*\n"
+        body += "📊 Source: NSE India"
+        
+        return header + body
+    
+    async def send_message(self, text):
+        """Send message to Telegram"""
+        if not self.bot:
+            logger.error("❌ Bot not initialized")
+            return False
+        
+        try:
+            # Split long messages
+            if len(text) > 4000:
+                parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+                for part in parts:
+                    await asyncio.to_thread(
+                        self.bot.send_message,
+                        chat_id=self.chat_id,
+                        text=part,
+                        parse_mode="Markdown"
+                    )
+                    await asyncio.sleep(0.5)
+            else:
+                await asyncio.to_thread(
+                    self.bot.send_message,
+                    chat_id=self.chat_id,
+                    text=text,
+                    parse_mode="Markdown"
+                )
+            
+            logger.info(f"📨 Message sent ({len(text)} chars)")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Send failed: {e}")
+            return False
+
+
+class MarketChecker:
+    """Check market hours"""
+    
+    @staticmethod
+    def is_market_open():
+        """Check if market is currently open"""
+        now = datetime.now(IST)
+        
+        # Weekend check
+        if now.weekday() >= 5:  # 5=Sat, 6=Sun
+            logger.info("📅 Weekend - market closed")
+            return False
+        
+        current_time = now.time()
+        is_open = MARKET_START <= current_time <= MARKET_END
+        
+        if is_open:
+            logger.info(f"✅ Market open at {current_time.strftime('%H:%M')} IST")
+        else:
+            logger.info(f"⏰ Market closed at {current_time.strftime('%H:%M')} IST")
+        
+        return is_open
+
+
+async def fetch_nse_data():
+    """Fetch and process NSE data"""
+    # Initialize components
+    nse = NSESession()
+    cache = CacheManager()
+    parser = DataParser()
+    
+    # Get cookies
+    if not nse.get_cookies():
+        logger.error("❌ Failed to initialize NSE session")
+        return None
+    
+    # Fetch expiry
+    logger.info("🔍 Fetching expiry...")
+    expiry_data = nse.fetch_json(EXPIRY_URL)
+    if not expiry_data or not isinstance(expiry_data, list):
+        logger.error("❌ Failed to fetch expiry")
+        return None
+    
+    expiry = expiry_data[0]
+    logger.info(f"📅 Expiry: {expiry}")
+    
+    # Fetch option chain
+    logger.info("🔍 Fetching option chain...")
+    url = OPTION_CHAIN_URL.format(exp=expiry)
+    chain_data = nse.fetch_json(url)
+    if not chain_data:
+        logger.error("❌ Failed to fetch option chain")
+        return None
+    
+    # Parse data
+    current_data = parser.parse_option_chain(chain_data)
+    if not current_data:
+        logger.error("❌ No data parsed")
+        return None
+    
+    # Load cache and calculate changes
+    prev_cache = cache.load()
+    processed_data = parser.calculate_changes(current_data, prev_cache)
+    
+    # Save to cache
+    cache.save(processed_data)
+    
+    return processed_data
+
+
+async def main():
+    """Main function"""
+    logger.info("=" * 60)
+    logger.info("🚀 NSE Option Chain Bot Started")
+    logger.info("=" * 60)
+    
+    # Check credentials
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("❌ TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set")
+        return
+    
+    # Check market hours
+    if not MarketChecker.is_market_open():
+        logger.info("⏰ Exiting - market closed")
+        return
+    
+    # Initialize Telegram
+    telegram = TelegramSender(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+    if not await telegram.initialize():
+        return
+    
+    # Fetch data
+    data = await fetch_nse_data()
+    if not data:
+        logger.error("❌ No data to send")
+        return
+    
+    # Send messages
+    ce_message = telegram.format_option_message(data, "CE")
+    pe_message = telegram.format_option_message(data, "PE")
+    
+    await telegram.send_message(ce_message)
+    await asyncio.sleep(1)
+    await telegram.send_message(pe_message)
+    
+    logger.info("✅ Bot completed successfully")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
-    # Quick run: if you prefer single-run, replace main_loop() with fetch_and_post_once()
     try:
-        asyncio.run(main_loop())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Interrupted by user, exiting.")
-
-
-# --- Auto Environment Config ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+        logger.info("👋 Bot stopped by user")
+    except Exception as e:
+        logger.exception(f"💥 Unhandled error: {e}")
+        sys.exit(1)
