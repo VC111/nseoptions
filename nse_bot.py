@@ -13,6 +13,7 @@ import logging
 CACHE_FILE = "last_oi.json"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+FORCE_RUN = os.getenv("FORCE_RUN", "false").lower() == "true"  # For testing
 
 # Market timings (IST)
 MARKET_START = dt_time(9, 15)   # 9:15 AM IST
@@ -260,7 +261,8 @@ class TelegramSender:
         try:
             request = HTTPXRequest(connection_pool_size=1)
             self.bot = Bot(token=self.token, request=request)
-            me = await asyncio.to_thread(self.bot.get_me)
+            # FIX: Properly await the coroutine
+            me = await self.bot.get_me()
             logger.info(f"✅ Telegram connected: @{me.username}")
             return True
         except Exception as e:
@@ -328,16 +330,16 @@ class TelegramSender:
             if len(text) > 4000:
                 parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
                 for part in parts:
-                    await asyncio.to_thread(
-                        self.bot.send_message,
+                    # FIX: Properly await the coroutine
+                    await self.bot.send_message(
                         chat_id=self.chat_id,
                         text=part,
                         parse_mode="Markdown"
                     )
                     await asyncio.sleep(0.5)
             else:
-                await asyncio.to_thread(
-                    self.bot.send_message,
+                # FIX: Properly await the coroutine
+                await self.bot.send_message(
                     chat_id=self.chat_id,
                     text=text,
                     parse_mode="Markdown"
@@ -356,6 +358,11 @@ class MarketChecker:
     @staticmethod
     def is_market_open():
         """Check if market is currently open"""
+        # FORCE_RUN=true hai to bypass market check
+        if FORCE_RUN:
+            logger.info("⚠️ FORCE_RUN enabled - bypassing market hours check")
+            return True
+            
         now = datetime.now(IST)
         
         # Weekend check
@@ -431,14 +438,15 @@ async def main():
         logger.error("❌ TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set")
         return
     
-    # Check market hours
-    if not MarketChecker.is_market_open():
+    # Check market hours (skip if FORCE_RUN is true)
+    if not FORCE_RUN and not MarketChecker.is_market_open():
         logger.info("⏰ Exiting - market closed")
         return
     
     # Initialize Telegram
     telegram = TelegramSender(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
     if not await telegram.initialize():
+        logger.error("❌ Failed to initialize Telegram")
         return
     
     # Fetch data
@@ -448,11 +456,14 @@ async def main():
         return
     
     # Send messages
+    logger.info("📤 Sending CE message...")
     ce_message = telegram.format_option_message(data, "CE")
-    pe_message = telegram.format_option_message(data, "PE")
-    
     await telegram.send_message(ce_message)
+    
     await asyncio.sleep(1)
+    
+    logger.info("📤 Sending PE message...")
+    pe_message = telegram.format_option_message(data, "PE")
     await telegram.send_message(pe_message)
     
     logger.info("✅ Bot completed successfully")
