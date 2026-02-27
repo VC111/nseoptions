@@ -3,9 +3,8 @@ name: NSE Option Chain Bot
 on:
   schedule:
     # Market hours: 9:15 AM to 3:30 PM IST
-    # UTC: 3:45 AM to 10:00 AM
-    - cron: '*/15 3-10 * * 1-5'   # Every 15 min during market
-    - cron: '30 10 * * 1-5'        # 4:00 PM IST (after market)
+    - cron: '*/15 3-10 * * 1-5'
+    - cron: '30 10 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -15,10 +14,12 @@ jobs:
       contents: write
     
     steps:
-      - uses: actions/checkout@v4
+      # checkout@v4 ka SHA - v4.2.2 version
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       
+      # setup-python@v5 ka SHA - v5.4.0 version
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55
         with:
           python-version: '3.11'
           cache: 'pip'
