@@ -2,7 +2,7 @@ name: NSE Option Chain Bot
 
 on:
   schedule:
-    # Market hours: 9:15 AM to 3:30 PM IST
+    # Market hours: 9:15 AM to 3:30 PM iINDAIAN STANDERD TIME 
     - cron: '*/15 3-10 * * 1-5'
     - cron: '30 10 * * 1-5'
   workflow_dispatch:
