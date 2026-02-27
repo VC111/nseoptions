@@ -2,10 +2,6 @@ name: NSE Option Chain Bot
 
 on:
   schedule:
-    # Market hours IST: 9:15 AM to 3:30 PM
-    # Converted to UTC: 3:45 AM to 10:00 AM
-    on:
-  schedule:
     # 9:15 AM IST = 3:45 UTC
     - cron: '45 3 * * 1-5'        # 9:15 AM IST
     - cron: '0 4 * * 1-5'         # 9:30 AM IST
@@ -33,6 +29,7 @@ on:
     - cron: '30 9 * * 1-5'        # 3:00 PM IST
     - cron: '45 9 * * 1-5'        # 3:15 PM IST
     - cron: '0 10 * * 1-5'        # 3:30 PM IST
+    
   workflow_dispatch:  # Manual trigger
 
 jobs:
@@ -58,7 +55,6 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # FORCE_RUN: true  # Uncomment for testing outside market hours
         run: python bt6.py
       
       - name: Commit cache (if updated)
