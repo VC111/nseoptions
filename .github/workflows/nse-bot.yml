@@ -1,0 +1,42 @@
+name: NSE Option Chain Bot
+
+on:
+  schedule:
+    # Market hours: 9:15 AM to 3:30 PM IST
+    # UTC: 3:45 AM to 10:00 AM
+    - cron: '*/15 3-10 * * 1-5'   # Every 15 min during market
+    - cron: '30 10 * * 1-5'        # 4:00 PM IST (after market)
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install requests python-telegram-bot pytz
+      
+      - name: Run bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python nse_bot.py
+      
+      - name: Commit cache
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_oi.json
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update OI cache [skip ci]"
+          git push
