@@ -2,42 +2,53 @@ name: NSE Option Chain Bot
 
 on:
   schedule:
-    # Running every 15 mins from 9:15 AM to 3:30 PM IST
-    # Since IST is UTC+5:30, we map backwards.
-    # 9:15 IST = 3:45 UTC
-    # 15:30 IST = 10:00 UTC
-    
-    # Instead of 25 lines, using ranges for robustness
-    # This runs every 15 minutes between UTC 3:45 and 10:00
-    - cron: '45,0,15,30,45 3,4,5,6,7,8,9 * * 1-5'
-    - cron: '0 10 * * 1-5' # 3:30 PM IST Last run
-    
-  workflow_dispatch:
+    # Market hours IST: 9:15 AM to 3:30 PM
+    # Converted to UTC: 3:45 AM to 10:00 AM
+    on:
+  schedule:
+    # 9:15 AM IST = 3:45 UTC
+    - cron: '45 3 * * 1-5'        # 9:15 AM IST
+    - cron: '0 4 * * 1-5'         # 9:30 AM IST
+    - cron: '15 4 * * 1-5'        # 9:45 AM IST
+    - cron: '30 4 * * 1-5'        # 10:00 AM IST
+    - cron: '45 4 * * 1-5'        # 10:15 AM IST
+    - cron: '0 5 * * 1-5'         # 10:30 AM IST
+    - cron: '15 5 * * 1-5'        # 10:45 AM IST
+    - cron: '30 5 * * 1-5'        # 11:00 AM IST
+    - cron: '45 5 * * 1-5'        # 11:15 AM IST
+    - cron: '0 6 * * 1-5'         # 11:30 AM IST
+    - cron: '15 6 * * 1-5'        # 11:45 AM IST
+    - cron: '30 6 * * 1-5'        # 12:00 PM IST
+    - cron: '45 6 * * 1-5'        # 12:15 PM IST
+    - cron: '0 7 * * 1-5'         # 12:30 PM IST
+    - cron: '15 7 * * 1-5'        # 12:45 PM IST
+    - cron: '30 7 * * 1-5'        # 1:00 PM IST
+    - cron: '45 7 * * 1-5'        # 1:15 PM IST
+    - cron: '0 8 * * 1-5'         # 1:30 PM IST
+    - cron: '15 8 * * 1-5'        # 1:45 PM IST
+    - cron: '30 8 * * 1-5'        # 2:00 PM IST
+    - cron: '45 8 * * 1-5'        # 2:15 PM IST
+    - cron: '0 9 * * 1-5'         # 2:30 PM IST
+    - cron: '15 9 * * 1-5'        # 2:45 PM IST
+    - cron: '30 9 * * 1-5'        # 3:00 PM IST
+    - cron: '45 9 * * 1-5'        # 3:15 PM IST
+    - cron: '0 10 * * 1-5'        # 3:30 PM IST
+  workflow_dispatch:  # Manual trigger
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    # Prevents overlapping runs
-    concurrency: 
-      group: nse-bot-run
-      cancel-in-progress: false
-      
     permissions:
-      contents: write
-    
-    # Set Timezone to IST for logs debugging
-    env:
-      TZ: Asia/Kolkata
+      contents: write  # To commit cache file
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55
         with:
           python-version: '3.11'
-          cache: 'pip'
       
       - name: Install dependencies
         run: |
@@ -47,9 +58,10 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # FORCE_RUN: true  # Uncomment for testing outside market hours
         run: python bt6.py
       
-      - name: Commit cache
+      - name: Commit cache (if updated)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
