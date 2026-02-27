@@ -4,6 +4,8 @@ import asyncio
 import sys
 import requests
 import pytz
+import random
+import time
 from datetime import datetime, time as dt_time
 from telegram import Bot
 from telegram.request import HTTPXRequest
@@ -13,21 +15,24 @@ import logging
 CACHE_FILE = "last_oi.json"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-FORCE_RUN = os.getenv("FORCE_RUN", "false").lower() == "true"  # For testing
+FORCE_RUN = os.getenv("FORCE_RUN", "false").lower() == "true"
 
 # Market timings (IST)
-MARKET_START = dt_time(9, 15)   # 9:15 AM IST
-MARKET_END = dt_time(15, 30)    # 3:30 PM IST
+MARKET_START = dt_time(9, 15)
+MARKET_END = dt_time(15, 30)
 
 # NSE API endpoints
 NSE_HOME = "https://www.nseindia.com"
 EXPIRY_URL = "https://www.nseindia.com/api/option-chain-contract-info?symbol=NIFTY"
 OPTION_CHAIN_URL = "https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY&expiry={exp}"
 
+# Alternative endpoints (backup)
+ALT_EXPIRY_URL = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+
 # Request settings
-REQUEST_TIMEOUT = 15
-MAX_RETRIES = 3
-RETRY_DELAY = 2
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 5
+RETRY_DELAY = 3
 
 # Logging setup
 logging.basicConfig(
@@ -42,21 +47,40 @@ IST = pytz.timezone('Asia/Kolkata')
 # ------------------------------------
 
 class NSESession:
-    """Manage NSE session with cookies"""
+    """Improved NSE session with better cookie handling"""
     
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "application/json, text/plain, */*",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
             "Referer": "https://www.nseindia.com/",
+            "Origin": "https://www.nseindia.com",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
         })
     
     def get_cookies(self):
-        """Initialize session cookies"""
+        """Initialize session with comprehensive cookie fetch"""
         try:
+            # First hit homepage
             self.session.get(NSE_HOME, timeout=REQUEST_TIMEOUT)
+            time.sleep(1)  # Small delay
+            
+            # Hit another endpoint to get more cookies
+            self.session.get("https://www.nseindia.com/regulations", timeout=REQUEST_TIMEOUT)
+            time.sleep(1)
+            
+            # Hit option chain page
+            self.session.get("https://www.nseindia.com/option-chain", timeout=REQUEST_TIMEOUT)
+            
             logger.info("✅ NSE session cookies obtained")
             return True
         except Exception as e:
@@ -64,16 +88,46 @@ class NSESession:
             return False
     
     def fetch_json(self, url):
-        """Fetch JSON with retry logic"""
+        """Fetch JSON with advanced retry logic"""
         for attempt in range(MAX_RETRIES):
             try:
-                resp = self.session.get(url, timeout=REQUEST_TIMEOUT)
-                resp.raise_for_status()
-                return resp.json()
+                # Add random delay to avoid rate limiting
+                if attempt > 0:
+                    delay = RETRY_DELAY * (attempt + random.uniform(0.5, 1.5))
+                    logger.info(f"⏳ Retry attempt {attempt + 1} after {delay:.1f}s delay")
+                    time.sleep(delay)
+                    
+                    # Refresh cookies on retry
+                    self.get_cookies()
+                
+                # Add random query param to bypass cache
+                separator = "&" if "?" in url else "?"
+                cache_buster = f"{separator}_={int(time.time() * 1000)}"
+                
+                resp = self.session.get(url + cache_buster, timeout=REQUEST_TIMEOUT)
+                
+                # Check response
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        if data:  # Valid JSON with content
+                            return data
+                    except:
+                        logger.warning(f"Invalid JSON response: {resp.text[:100]}")
+                elif resp.status_code == 403:
+                    logger.warning("Access forbidden - refreshing cookies")
+                    self.get_cookies()
+                elif resp.status_code == 429:
+                    logger.warning("Rate limited - waiting longer")
+                    time.sleep(RETRY_DELAY * 2)
+                    
+            except requests.exceptions.Timeout:
+                logger.warning(f"Timeout on attempt {attempt + 1}")
+            except requests.exceptions.ConnectionError:
+                logger.warning(f"Connection error on attempt {attempt + 1}")
             except Exception as e:
                 logger.warning(f"Attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
-                if attempt < MAX_RETRIES - 1:
-                    asyncio.sleep(RETRY_DELAY)
+        
         return None
 
 
@@ -177,7 +231,13 @@ class DataParser:
         """Extract option chain data from JSON"""
         rows = []
         try:
-            records = json_data.get("records", {}).get("data", [])
+            # Handle different response formats
+            if "records" in json_data:
+                records = json_data.get("records", {}).get("data", [])
+            elif "data" in json_data:
+                records = json_data.get("data", [])
+            else:
+                records = json_data.get("filtered", {}).get("data", [])
             
             for item in records:
                 strike = str(item.get("strikePrice"))
@@ -206,6 +266,8 @@ class DataParser:
             logger.info(f"📊 Parsed {len(rows)} strikes")
         except Exception as e:
             logger.error(f"❌ Parse failed: {e}")
+            import traceback
+            traceback.print_exc()
         
         return rows
     
@@ -261,7 +323,6 @@ class TelegramSender:
         try:
             request = HTTPXRequest(connection_pool_size=1)
             self.bot = Bot(token=self.token, request=request)
-            # FIX: Properly await the coroutine
             me = await self.bot.get_me()
             logger.info(f"✅ Telegram connected: @{me.username}")
             return True
@@ -294,7 +355,7 @@ class TelegramSender:
             data_rows,
             key=lambda x: abs(x.get(delta_raw_key, 0)),
             reverse=True
-        )[:15]  # Top 15
+        )[:15]
         
         # Sort by strike for display
         sorted_rows.sort(key=lambda x: float(x.get("strike", 0)))
@@ -326,11 +387,9 @@ class TelegramSender:
             return False
         
         try:
-            # Split long messages
             if len(text) > 4000:
                 parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
                 for part in parts:
-                    # FIX: Properly await the coroutine
                     await self.bot.send_message(
                         chat_id=self.chat_id,
                         text=part,
@@ -338,7 +397,6 @@ class TelegramSender:
                     )
                     await asyncio.sleep(0.5)
             else:
-                # FIX: Properly await the coroutine
                 await self.bot.send_message(
                     chat_id=self.chat_id,
                     text=text,
@@ -358,7 +416,6 @@ class MarketChecker:
     @staticmethod
     def is_market_open():
         """Check if market is currently open"""
-        # FORCE_RUN=true hai to bypass market check
         if FORCE_RUN:
             logger.info("⚠️ FORCE_RUN enabled - bypassing market hours check")
             return True
@@ -366,7 +423,7 @@ class MarketChecker:
         now = datetime.now(IST)
         
         # Weekend check
-        if now.weekday() >= 5:  # 5=Sat, 6=Sun
+        if now.weekday() >= 5:
             logger.info("📅 Weekend - market closed")
             return False
         
@@ -381,6 +438,41 @@ class MarketChecker:
         return is_open
 
 
+async def fetch_expiry_with_retry(nse):
+    """Fetch expiry with multiple attempts and fallback"""
+    
+    # Method 1: Direct expiry API
+    logger.info("🔍 Method 1: Fetching from expiry API...")
+    expiry_data = nse.fetch_json(EXPIRY_URL)
+    if expiry_data and isinstance(expiry_data, list) and len(expiry_data) > 0:
+        expiry = expiry_data[0]
+        logger.info(f"📅 Expiry found (Method 1): {expiry}")
+        return expiry
+    
+    # Method 2: Alternative expiry endpoint
+    logger.info("🔍 Method 2: Trying alternative expiry endpoint...")
+    alt_data = nse.fetch_json(ALT_EXPIRY_URL)
+    if alt_data and "records" in alt_data:
+        expiry_dates = alt_data.get("records", {}).get("expiryDates", [])
+        if expiry_dates and len(expiry_dates) > 0:
+            expiry = expiry_dates[0]
+            logger.info(f"📅 Expiry found (Method 2): {expiry}")
+            return expiry
+    
+    # Method 3: Parse from option chain directly
+    logger.info("🔍 Method 3: Trying to get expiry from option chain...")
+    chain_data = nse.fetch_json("https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY")
+    if chain_data and "records" in chain_data:
+        expiry_dates = chain_data.get("records", {}).get("expiryDates", [])
+        if expiry_dates and len(expiry_dates) > 0:
+            expiry = expiry_dates[0]
+            logger.info(f"📅 Expiry found (Method 3): {expiry}")
+            return expiry
+    
+    logger.error("❌ All expiry fetch methods failed")
+    return None
+
+
 async def fetch_nse_data():
     """Fetch and process NSE data"""
     # Initialize components
@@ -393,20 +485,27 @@ async def fetch_nse_data():
         logger.error("❌ Failed to initialize NSE session")
         return None
     
-    # Fetch expiry
-    logger.info("🔍 Fetching expiry...")
-    expiry_data = nse.fetch_json(EXPIRY_URL)
-    if not expiry_data or not isinstance(expiry_data, list):
-        logger.error("❌ Failed to fetch expiry")
-        return None
-    
-    expiry = expiry_data[0]
-    logger.info(f"📅 Expiry: {expiry}")
+    # Fetch expiry with retry
+    expiry = await fetch_expiry_with_retry(nse)
+    if not expiry:
+        # Try one more time with fresh session
+        logger.info("🔄 Creating fresh session and retrying...")
+        nse = NSESession()
+        nse.get_cookies()
+        expiry = await fetch_expiry_with_retry(nse)
+        if not expiry:
+            return None
     
     # Fetch option chain
-    logger.info("🔍 Fetching option chain...")
+    logger.info(f"🔍 Fetching option chain for expiry: {expiry}")
     url = OPTION_CHAIN_URL.format(exp=expiry)
     chain_data = nse.fetch_json(url)
+    
+    # Fallback: Try without expiry
+    if not chain_data:
+        logger.info("🔄 Trying option chain without expiry...")
+        chain_data = nse.fetch_json("https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY")
+    
     if not chain_data:
         logger.error("❌ Failed to fetch option chain")
         return None
@@ -438,7 +537,7 @@ async def main():
         logger.error("❌ TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set")
         return
     
-    # Check market hours (skip if FORCE_RUN is true)
+    # Check market hours
     if not FORCE_RUN and not MarketChecker.is_market_open():
         logger.info("⏰ Exiting - market closed")
         return
