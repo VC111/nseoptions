@@ -40,18 +40,20 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@v4
       
       - name: Setup Python
-        uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'  # 👈 Dependencies cache karo
       
       - name: Install dependencies
         run: |
           pip install requests python-telegram-bot
       
       - name: Run bot
+        timeout-minutes: 5
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -63,4 +65,4 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add last_oi.json
           git diff --quiet && git diff --staged --quiet || git commit -m "Update OI cache [skip ci]"
-          git push
+          git push || true
