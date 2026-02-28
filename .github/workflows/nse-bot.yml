@@ -2,33 +2,8 @@ name: NSE Option Chain Bot
 
 on:
   schedule:
-    - cron: '45 3 * * 1-5'        # 9:15 AM IST
-    - cron: '0 4 * * 1-5'         # 9:30 AM IST
-    - cron: '15 4 * * 1-5'        # 9:45 AM IST
-    - cron: '30 4 * * 1-5'        # 10:00 AM IST
-    - cron: '45 4 * * 1-5'        # 10:15 AM IST
-    - cron: '0 5 * * 1-5'         # 10:30 AM IST
-    - cron: '15 5 * * 1-5'        # 10:45 AM IST
-    - cron: '30 5 * * 1-5'        # 11:00 AM IST
-    - cron: '45 5 * * 1-5'        # 11:15 AM IST
-    - cron: '0 6 * * 1-5'         # 11:30 AM IST
-    - cron: '15 6 * * 1-5'        # 11:45 AM IST
-    - cron: '30 6 * * 1-5'        # 12:00 PM IST
-    - cron: '45 6 * * 1-5'        # 12:15 PM IST
-    - cron: '0 7 * * 1-5'         # 12:30 PM IST
-    - cron: '15 7 * * 1-5'        # 12:45 PM IST
-    - cron: '30 7 * * 1-5'        # 1:00 PM IST
-    - cron: '45 7 * * 1-5'        # 1:15 PM IST
-    - cron: '0 8 * * 1-5'         # 1:30 PM IST
-    - cron: '15 8 * * 1-5'        # 1:45 PM IST
-    - cron: '30 8 * * 1-5'        # 2:00 PM IST
-    - cron: '45 8 * * 1-5'        # 2:15 PM IST
-    - cron: '0 9 * * 1-5'         # 2:30 PM IST
-    - cron: '15 9 * * 1-5'        # 2:45 PM IST
-    - cron: '30 9 * * 1-5'        # 3:00 PM IST
-    - cron: '45 9 * * 1-5'        # 3:15 PM IST
-    - cron: '0 10 * * 1-5'        # 3:30 PM IST
-    
+    # Har 15 minute 3:00 UTC se 10:45 UTC tak (Monday-Friday)
+    - cron: '*/15 3-10 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -38,34 +13,22 @@ jobs:
       contents: write
     
     steps:
-      - name: Checkout code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-        with:
-          token: ${{ secrets.GH_TOKEN }}
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       
-      - name: Setup Python
-        uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55  # v5.4.0
+      - uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55
         with:
           python-version: '3.11'
-          cache: 'pip'
       
-      - name: Install dependencies
-        run: |
-          pip install requests python-telegram-bot
+      - run: pip install requests python-telegram-bot
       
-      - name: Run bot
-        timeout-minutes: 5
+      - run: python bt6.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python bt6.py
       
-      - name: Commit cache (if updated)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
+      - run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add last_oi.json
           git diff --quiet && git diff --staged --quiet || git commit -m "Update OI cache [skip ci]"
-          git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git HEAD:${GITHUB_REF#refs/heads/} || true
+          git push
