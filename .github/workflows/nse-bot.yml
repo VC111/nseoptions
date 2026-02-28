@@ -1,10 +1,9 @@
 name: NSE Option Chain Bot
 
 on:
-  schedule:
-    # Har 15 minute 3:00 UTC se 10:45 UTC tak (Monday-Friday)
-    - cron: '*/15 3-10 * * 1-5'
-  workflow_dispatch:
+  repository_dispatch:
+    types: [cron-trigger]   # 👈 SIRF YEH – cron-job.org se aayega
+  workflow_dispatch:         # manual trigger (optional)
 
 jobs:
   run-bot:
