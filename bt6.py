@@ -15,8 +15,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # GitHub Secrets se lega
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # GitHub Secrets se lega
 FETCH_INTERVAL_SECONDS = 900  # Not used in GitHub Actions (will run on schedule)
 RUN_DURING_MARKET_HOURS = True
-MARKET_START = dt_time(9, 15)
-MARKET_END = dt_time(15, 30)
+MARKET_START = dt_time(8, 55)
+MARKET_END = dt_time(15, 40)
 ATM_RANGE = 300  # ±300 around ATM
 
 # NSE India API endpoints
