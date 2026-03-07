@@ -21,7 +21,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 FETCH_INTERVAL_SECONDS = 900   # not used in GitHub Actions
 RUN_DURING_MARKET_HOURS = True
-MARKET_START = dt_time(9, 15)   # actual trading start
+# Changed Market Start to 9:00 AM to capture opening data
+MARKET_START = dt_time(9, 0)   
 MARKET_END = dt_time(15, 40)
 ATM_RANGE = 300                  # ±300 around ATM
 
@@ -104,14 +105,14 @@ def write_marker(marker_file, date_str):
 def should_reset():
     """
     Returns True if:
-      - current time is between 8:00 and 9:00 (approx) AND
+      - current time is between 15:40 and 16:00 (approx) AND
       - reset hasn't been done today (marker date != today)
     """
     now_ist = get_current_time_ist()
     today = now_ist.strftime("%Y-%m-%d")
-    # Reset window: 8:00 AM to 9:00 AM
-    reset_start = dt_time(8, 0)
-    reset_end = dt_time(9, 0)
+    # Reset window changed to 3:40 PM to 4:00 PM for End of Day
+    reset_start = dt_time(15, 40)
+    reset_end = dt_time(16, 0)
     if reset_start <= now_ist.time() <= reset_end:
         last_reset = read_marker(RESET_MARKER)
         if last_reset != today:
@@ -120,11 +121,11 @@ def should_reset():
 
 def perform_reset():
     """
-    - If CACHE_FILE exists and has data, move it to archive with yesterday's date.
+    - If CACHE_FILE exists and has data, move it to archive with yesterday's date (or today if file is from today).
     - Then clear CACHE_FILE (create empty JSON).
     - Update reset marker.
     """
-    logger.info("Performing daily reset at 9 AM...")
+    logger.info("Performing End of Day reset at 3:45 PM...")
     # Archive previous day's cache if it exists and has data
     if os.path.exists(CACHE_FILE):
         try:
@@ -135,15 +136,20 @@ def perform_reset():
                 mtime = os.path.getmtime(CACHE_FILE)
                 file_date = datetime.fromtimestamp(mtime, tz=timezone.utc) + timedelta(hours=5, minutes=30)
                 archive_date = file_date.strftime("%Y-%m-%d")
-                # If file_date is today (possible if script ran early morning), use yesterday
-                if archive_date == get_today_date_str():
-                    archive_date = get_yesterday_date_str()
+                
+                # If for some reason file is from future or same day, we ensure we don't overwrite wrong file
+                # But usually EOD reset happens for today's file
                 archive_path = os.path.join(ARCHIVE_DIR, f"last_oi_{archive_date}.json")
                 shutil.move(CACHE_FILE, archive_path)
-                logger.info(f"Archived previous cache to {archive_path}")
+                logger.info(f"Archived current session data to {archive_path}")
         except Exception as e:
             logger.warning(f"Could not archive previous cache: {e}")
-    # Ensure cache file exists and is empty
+    
+    # Ensure cache file exists and is empty for next session (delete OI data)
+    if os.path.exists(CACHE_FILE):
+        os.remove(CACHE_FILE)
+        logger.info("Deleted existing cache file (OI data delete).")
+        
     with open(CACHE_FILE, "w") as f:
         json.dump({}, f)
     logger.info("Cache cleared for new trading day.")
@@ -279,7 +285,7 @@ def get_spot_price(json_data):
     try:
         underlying = json_data.get("records", {}).get("underlyingValue", 0)
         if underlying:
-            logger.info(f"Spot price: {underlying}")
+            # logger.info(f"Spot price: {underlying}") # Reduced noise
             return float(underlying)
     except Exception as e:
         logger.error(f"Failed to get spot price: {e}")
@@ -325,7 +331,7 @@ def parse_nse_data(json_data):
                 "ce_oi_plain": fmt_plain(ce_oi),
                 "pe_oi_plain": fmt_plain(pe_oi),
             })
-        logger.info(f"Parsed {len(rows)} strikes")
+        # logger.info(f"Parsed {len(rows)} strikes") # Reduced noise
     except Exception as e:
         logger.error(f"Parsing failed: {e}")
     return rows
@@ -474,7 +480,7 @@ async def send_to_telegram(text, parse_mode="Markdown"):
         logger.warning(f"Telegram send failed: {e}")
         return False
 
-# ---------- Market hours check (updated start time to 9:15) ----------
+# ---------- Market hours check (updated start time to 9:00) ----------
 def in_market_hours():
     if FORCE_RUN:
         logger.info("FORCE_RUN enabled - bypassing market hours")
@@ -502,9 +508,13 @@ async def run_once():
     # Ensure archive directory exists
     ensure_archive_dir()
 
-    # --- Daily reset at 9 AM ---
+    # --- Daily reset at 3:45 PM ---
     if should_reset():
         perform_reset()
+        # After reset, we typically stop or let the next fetch cycle handle it.
+        # Since reset is at 15:40, and market ends at 15:40, we can return.
+        logger.info("EOD Reset performed. Waiting for next scheduled run.")
+        return
 
     # --- Market hours check ---
     if not in_market_hours():
@@ -526,6 +536,8 @@ async def run_once():
         max_retries = 3
         retry_delay = 30  # seconds
         json_data = None
+        
+        # Opening data validation logic: Retry if data is invalid
         for attempt in range(max_retries):
             json_data = fetch_option_chain(expiry)
             if json_data and is_data_valid(json_data):
@@ -563,9 +575,10 @@ async def run_once():
 
         save_last_oi(computed)
 
-        # --- End-of-day archive at 3:45 PM ---
-        if should_archive():
-            perform_archive()
+        # Note: perform_archive() logic is separate from reset now if desired, 
+        # but usually reset handles the file movement. 
+        # If you want to keep a copy during the day, use perform_archive logic.
+        # Currently reset handles the "delete/move" at 3:45 PM.
 
         ce_msg = format_ce_message(computed, spot_price, top_n=len(computed))
         pe_msg = format_pe_message(computed, spot_price, top_n=len(computed))
