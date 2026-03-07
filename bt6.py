@@ -104,14 +104,14 @@ def write_marker(marker_file, date_str):
 def should_reset():
     """
     Returns True if:
-      - current time is between 9:00 and 10:00 (approx) AND
+      - current time is between 8:00 and 9:00 (approx) AND
       - reset hasn't been done today (marker date != today)
     """
     now_ist = get_current_time_ist()
     today = now_ist.strftime("%Y-%m-%d")
-    # Reset window: 9:00 AM to 10:00 AM
-    reset_start = dt_time(9, 0)
-    reset_end = dt_time(10, 0)
+    # Reset window: 8:00 AM to 9:00 AM
+    reset_start = dt_time(8, 0)
+    reset_end = dt_time(9, 0)
     if reset_start <= now_ist.time() <= reset_end:
         last_reset = read_marker(RESET_MARKER)
         if last_reset != today:
